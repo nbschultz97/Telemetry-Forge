@@ -1,0 +1,308 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+import logging.handlers
+import os
+import sys
+import time
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, Iterable, List
+
+from ceradon_sam_bot.config import ConfigError, load_config
+from ceradon_sam_bot.normalize import normalize_opportunity
+from ceradon_sam_bot.notify_email import send_email
+from ceradon_sam_bot.render import render_digest
+from ceradon_sam_bot.sam_client import SamClient, SamClientConfig
+from ceradon_sam_bot.scoring import score_opportunity
+from ceradon_sam_bot.store import (
+    fetch_by_notice_id,
+    fetch_latest_for_digest,
+    fetch_since_days,
+    init_db,
+    upsert_opportunity,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        standard_keys = {
+            "name",
+            "msg",
+            "args",
+            "levelname",
+            "levelno",
+            "pathname",
+            "filename",
+            "module",
+            "exc_info",
+            "exc_text",
+            "stack_info",
+            "lineno",
+            "funcName",
+            "created",
+            "msecs",
+            "relativeCreated",
+            "thread",
+            "threadName",
+            "processName",
+            "process",
+        }
+        payload = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "logger": record.name,
+        }
+        if hasattr(record, "run_id"):
+            payload["run_id"] = record.run_id
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        extras = {k: v for k, v in record.__dict__.items() if k not in standard_keys}
+        payload.update(extras)
+        return json.dumps(payload)
+
+
+class RunIdFilter(logging.Filter):
+    def __init__(self, run_id: str) -> None:
+        super().__init__()
+        self.run_id = run_id
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.run_id = self.run_id
+        return True
+
+
+def _setup_logging(log_dir: Path, run_id: str) -> None:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    formatter = JsonFormatter()
+    handler_stdout = logging.StreamHandler(sys.stdout)
+    handler_stdout.setFormatter(formatter)
+    handler_stdout.addFilter(RunIdFilter(run_id))
+
+    handler_file = logging.handlers.RotatingFileHandler(
+        log_dir / "ceradon_sam_bot.log", maxBytes=1_000_000, backupCount=3
+    )
+    handler_file.setFormatter(formatter)
+    handler_file.addFilter(RunIdFilter(run_id))
+
+    logging.basicConfig(level=logging.INFO, handlers=[handler_stdout, handler_file])
+
+
+def _require_env(name: str, default: str | None = None) -> str:
+    value = os.getenv(name, default)
+    if value is None or value == "":
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def _load_client() -> SamClient:
+    api_key = _require_env("SAM_API_KEY")
+    api_key_in_query = os.getenv("SAM_API_KEY_IN_QUERY", "false").lower() == "true"
+    return SamClient(
+        SamClientConfig(api_key=api_key, api_key_in_query=api_key_in_query)
+    )
+
+
+def _build_query_params(days: int) -> Dict[str, Any]:
+    posted_from = (datetime.utcnow() - timedelta(days=days)).strftime("%m/%d/%Y")
+    posted_to = datetime.utcnow().strftime("%m/%d/%Y")
+    return {
+        "postedFrom": posted_from,
+        "postedTo": posted_to,
+    }
+
+
+def _process_opportunities(
+    raw_items: Iterable[Dict[str, Any]],
+    config,
+    db_path: Path,
+) -> Dict[str, int]:
+    counts = {"processed": 0, "saved": 0, "skipped": 0}
+    for raw in raw_items:
+        counts["processed"] += 1
+        try:
+            normalized = normalize_opportunity(raw)
+            if normalized.get("notice_type") in config.filters.exclude_notice_types:
+                counts["skipped"] += 1
+                continue
+            naics = normalized.get("naics")
+            if naics and naics not in config.filters.naics_include:
+                counts["skipped"] += 1
+                continue
+            score, reasons = score_opportunity(normalized, config)
+            saved = upsert_opportunity(db_path, normalized, raw, score, reasons)
+            if saved:
+                counts["saved"] += 1
+            else:
+                counts["skipped"] += 1
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Failed to process opportunity", extra={"error": str(exc)})
+            counts["skipped"] += 1
+    return counts
+
+
+def run_once(config_path: Path, data_dir: Path) -> None:
+    config = load_config(config_path)
+    db_path = data_dir / "ceradon_sam_bot.sqlite"
+    init_db(db_path)
+
+    client = _load_client()
+    params = _build_query_params(config.filters.posted_from_days)
+
+    raw_items = client.search_opportunities(params)
+    processed = _process_opportunities(raw_items, config, db_path)
+
+    digest_rows = fetch_latest_for_digest(
+        db_path,
+        config.scoring.include_in_digest_score,
+        config.digest.max_items,
+    )
+
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER", "noah@ceradonsystems.com")
+    smtp_pass = _require_env("SMTP_PASS")
+    email_to = os.getenv("EMAIL_TO", "noah@ceradonsystems.com")
+    email_from = os.getenv("EMAIL_FROM", "noah@ceradonsystems.com")
+
+    body = render_digest(digest_rows)
+    subject = f"Ceradon SAM Digest ({len(digest_rows)} items)"
+    send_email(smtp_host, smtp_port, smtp_user, smtp_pass, email_to, email_from, subject, body)
+
+    LOGGER.info("Run completed", extra={"counts": processed, "digest_items": len(digest_rows)})
+
+
+def run_daemon(config_path: Path, data_dir: Path, interval_minutes: int) -> None:
+    while True:
+        run_once(config_path, data_dir)
+        time.sleep(interval_minutes * 60)
+
+
+def backfill(config_path: Path, data_dir: Path, days: int) -> None:
+    config = load_config(config_path)
+    db_path = data_dir / "ceradon_sam_bot.sqlite"
+    init_db(db_path)
+
+    client = _load_client()
+    params = _build_query_params(days)
+    raw_items = client.search_opportunities(params)
+    processed = _process_opportunities(raw_items, config, db_path)
+    LOGGER.info("Backfill completed", extra={"counts": processed})
+
+
+def export_data(data_dir: Path, since_days: int, fmt: str) -> None:
+    db_path = data_dir / "ceradon_sam_bot.sqlite"
+    rows = fetch_since_days(db_path, since_days)
+    if fmt != "csv":
+        raise ValueError("Only csv export is supported")
+    writer = csv.writer(sys.stdout)
+    writer.writerow(
+        [
+            "notice_id",
+            "title",
+            "agency",
+            "notice_type",
+            "naics",
+            "set_aside",
+            "posted_date",
+            "response_deadline",
+            "score",
+            "link",
+        ]
+    )
+    for row in rows:
+        writer.writerow(
+            [
+                row["notice_id"],
+                row["title"],
+                row["agency"],
+                row["notice_type"],
+                row["naics"],
+                row["set_aside"],
+                row["posted_date"],
+                row["response_deadline"],
+                row["score"],
+                row["link"],
+            ]
+        )
+
+
+def explain_notice(data_dir: Path, notice_id: str) -> None:
+    db_path = data_dir / "ceradon_sam_bot.sqlite"
+    stored = fetch_by_notice_id(db_path, notice_id)
+    if not stored:
+        print(f"Notice {notice_id} not found")
+        return
+    print(f"Title: {stored.title}")
+    print(f"Score: {stored.score}")
+    print("Reasons:")
+    for reason in stored.reasons:
+        print(f"- {reason}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Ceradon SAM Opportunity Bot")
+    subparsers = parser.add_subparsers(dest="command")
+
+    run_parser = subparsers.add_parser("run", help="Run the bot")
+    run_parser.add_argument("--config", required=True, help="Path to config YAML")
+    run_parser.add_argument("--once", action="store_true", help="Run once and exit")
+    run_parser.add_argument("--daemon", action="store_true", help="Run as daemon loop")
+    run_parser.add_argument(
+        "--interval-minutes", type=int, default=1440, help="Loop interval in minutes"
+    )
+
+    backfill_parser = subparsers.add_parser("backfill", help="Backfill past days")
+    backfill_parser.add_argument("--config", required=True, help="Path to config YAML")
+    backfill_parser.add_argument("--days", type=int, default=60, help="Days to backfill")
+
+    export_parser = subparsers.add_parser("export", help="Export data")
+    export_parser.add_argument("--format", default="csv", choices=["csv"])
+    export_parser.add_argument("--since-days", type=int, default=30)
+
+    explain_parser = subparsers.add_parser("explain", help="Explain a notice score")
+    explain_parser.add_argument("--notice-id", required=True)
+
+    return parser
+
+
+def main() -> None:
+    run_id = str(uuid.uuid4())
+    data_dir = Path(os.getenv("BOT_DATA_DIR", "/var/lib/ceradon-sam-bot"))
+    log_dir = data_dir / "logs"
+    _setup_logging(log_dir, run_id)
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command == "run":
+        try:
+            config_path = Path(args.config)
+            if args.daemon:
+                run_daemon(config_path, data_dir, args.interval_minutes)
+            else:
+                run_once(config_path, data_dir)
+        except ConfigError as exc:
+            LOGGER.error("Configuration error", extra={"error": str(exc), "run_id": run_id})
+            sys.exit(1)
+    elif args.command == "backfill":
+        config_path = Path(args.config)
+        backfill(config_path, data_dir, args.days)
+    elif args.command == "export":
+        export_data(data_dir, args.since_days, args.format)
+    elif args.command == "explain":
+        explain_notice(data_dir, args.notice_id)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
