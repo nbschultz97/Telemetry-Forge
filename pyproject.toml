@@ -1,0 +1,31 @@
+[project]
+name = "ceradon-sam-bot"
+version = "0.1.0"
+description = "Offline-first SAM.gov opportunity monitor for Ceradon Systems"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {file = "LICENSE"}
+authors = [{name = "Ceradon Systems"}]
+keywords = ["sam.gov", "opportunities", "raspberry-pi", "offline-first"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+  "PyYAML>=6.0",
+  "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4.0",
+]
+
+[project.scripts]
+ceradon-sam-bot = "ceradon_sam_bot.main:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

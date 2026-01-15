@@ -1,0 +1,19 @@
+version: "3.9"
+services:
+  ceradon-sam-bot:
+    build: .
+    environment:
+      - SAM_API_KEY=${SAM_API_KEY}
+      - SMTP_PASS=${SMTP_PASS}
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-noah@ceradonsystems.com}
+      - EMAIL_TO=${EMAIL_TO:-noah@ceradonsystems.com}
+      - EMAIL_FROM=${EMAIL_FROM:-noah@ceradonsystems.com}
+      - BOT_DATA_DIR=/var/lib/ceradon-sam-bot
+    volumes:
+      - ./config:/app/config
+      - ceradon-data:/var/lib/ceradon-sam-bot
+
+volumes:
+  ceradon-data:
